@@ -2881,13 +2881,22 @@ export async function getGitBinding(projectHash: string): Promise<any> {
   return resp.json();
 }
 
-export async function saveGitBinding(config: any): Promise<{ success: boolean }> {
+export async function saveGitBinding(config: any): Promise<{ success: boolean; error?: string }> {
   const resp = await apiFetch('/api/git/binding', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify(config),
   });
-  if (!resp.ok) return { success: false };
+  if (!resp.ok) {
+    let errorMsg = '';
+    try {
+      const err = await resp.json();
+      errorMsg = err.error || err.message;
+    } catch {
+      errorMsg = await resp.text().catch(() => '');
+    }
+    return { success: false, error: errorMsg || `HTTP ${resp.status}` };
+  }
   return resp.json();
 }
 

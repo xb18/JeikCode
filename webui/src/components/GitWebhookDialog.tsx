@@ -393,7 +393,7 @@ export function toCleanApiPayload(config: GitAdapterConfig, projectHash: string)
   };
 }
 
-export function saveProjectGitConfig(projectHash: string, config: GitAdapterConfig): void {
+export async function saveProjectGitConfig(projectHash: string, config: GitAdapterConfig): Promise<{ success: boolean; error?: string }> {
   const cleanPayload = config.webhook?.payloadUrl
     ? normalizeWebhookHost(config.webhook.payloadUrl).replace(/\/+$/, '')
     : '';
@@ -408,9 +408,7 @@ export function saveProjectGitConfig(projectHash: string, config: GitAdapterConf
     // ignore
   }
   // 异步同步到后端持久化文件 (~/.jeikcode/git-bindings.json)
-  saveGitBinding(clean).catch((e) => {
-    console.error('[git_webhook] Failed to save binding:', e);
-  });
+  return saveGitBinding(clean);
 }
 
 interface GitWebhookDialogProps {
@@ -498,9 +496,23 @@ export function GitWebhookDialog({ project, onClose, onSaved }: GitWebhookDialog
           // 关键修复：项目已有的配置绝对优先，绝不被继承值覆盖！
           const effectivePayload = cleanRemotePayload || prev.webhook.payloadUrl || getLastWebhookHost();
 
+          // 核心防线：绝不能拿远端的空值冲掉本地刚填好或已存的有效数据！
+          const effectiveToken = (remote.accessToken && remote.accessToken.trim()) ||
+                                 (remote.access_token && remote.access_token.trim()) ||
+                                 prev.accessToken;
+          const effectiveRepo = (remote.repoIdentifier && remote.repoIdentifier.trim()) ||
+                                (remote.repo_identifier && remote.repo_identifier.trim()) ||
+                                prev.repoIdentifier;
+          const effectivePrompt = (remote.reviewPromptTemplate && remote.reviewPromptTemplate.trim()) ||
+                                  (remote.review_prompt_template && remote.review_prompt_template.trim()) ||
+                                  prev.reviewPromptTemplate;
+
           return {
             ...prev,
             ...remote,
+            accessToken: effectiveToken,
+            repoIdentifier: effectiveRepo,
+            reviewPromptTemplate: effectivePrompt,
             webhook: {
               ...prev.webhook,
               ...(remote.webhook || {}),
@@ -542,14 +554,22 @@ export function GitWebhookDialog({ project, onClose, onSaved }: GitWebhookDialog
     });
   };
 
-  const handleSave = () => {
+  const handleSave = async () => {
     const configToSave = { ...config, lang };
-    saveProjectGitConfig(project.hash, configToSave);
-    showToast(t('gitWebhook.saveSuccess'));
-    if (onSaved) onSaved(configToSave);
-    setTimeout(() => {
-      onClose();
-    }, 600);
+    try {
+      const res = await saveProjectGitConfig(project.hash, configToSave);
+      if (res && res.success === false) {
+        showToast(res.error || '保存到后端失败', 'error');
+        return;
+      }
+      showToast(t('gitWebhook.saveSuccess'), 'success');
+      if (onSaved) onSaved(configToSave);
+      setTimeout(() => {
+        onClose();
+      }, 600);
+    } catch (e: any) {
+      showToast(e.message || '保存失败', 'error');
+    }
   };
 
   const handleRegenerateSecret = () => {
