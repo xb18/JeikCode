@@ -87,6 +87,163 @@ pub async fn test_git_binding_api(Json(config): Json<GitAdapterConfig>) -> impl 
     }
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GenerateAppTokenRequest {
+    #[serde(alias = "app_id")]
+    pub app_id: u64,
+    #[serde(default, alias = "private_key_path")]
+    pub private_key_path: Option<String>,
+    #[serde(default, alias = "private_key")]
+    pub private_key: Option<String>,
+    #[serde(default, alias = "repo_identifier")]
+    pub repo_identifier: Option<String>,
+    #[serde(default, alias = "project_hash")]
+    pub project_hash: Option<String>,
+}
+
+/// POST /api/git/generate-token
+/// 使用 GitHub App ID 和私钥，在后端内部自动计算 JWT 并向 GitHub 换取官方 [bot] 安装访问令牌
+pub async fn generate_app_token_api(
+    Json(req): Json<GenerateAppTokenRequest>,
+) -> impl IntoResponse {
+    let repo = req
+        .repo_identifier
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "jeikl/JeikCode".to_string());
+
+    // 确定私钥文件路径（支持直接传路径或传入私钥文本自动存为临时文件）
+    let (key_path, is_temp) =
+        if let Some(path) = req.private_key_path.filter(|s| !s.trim().is_empty()) {
+            (std::path::PathBuf::from(path.trim()), false)
+        } else if let Some(content) = req.private_key.filter(|s| !s.trim().is_empty()) {
+            let temp_dir = std::env::temp_dir();
+            let temp_file = temp_dir.join(format!("jeikcode_app_key_{}.pem", req.app_id));
+            if let Err(e) = std::fs::write(&temp_file, content.trim()) {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "success": false,
+                        "error": format!("Failed to write private key to temp file: {e}")
+                    })),
+                )
+                    .into_response();
+            }
+            (temp_file, true)
+        } else {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": "Missing private key (please provide a file path or key content)"
+                })),
+            )
+                .into_response();
+        };
+
+    if !key_path.exists() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "success": false,
+                "error": format!("Private key file does not exist: {}", key_path.display())
+            })),
+        )
+            .into_response();
+    }
+
+    // 调用认证脚本完成 JWT 计算与令牌签发
+    let script_path = "scripts/github_app_auth.py";
+    let cmd = tokio::process::Command::new("python")
+        .args([
+            script_path,
+            &req.app_id.to_string(),
+            &key_path.to_string_lossy(),
+            &repo,
+        ])
+        .output()
+        .await;
+
+    let output = match cmd {
+        Ok(o) => o,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": format!("Failed to execute auth script: {e}")
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    if is_temp {
+        let _ = std::fs::remove_file(&key_path);
+    }
+
+    if !output.status.success() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "success": false,
+                "error": format!("GitHub App authentication failed: {} {}", stdout.trim(), stderr.trim())
+            })),
+        )
+            .into_response();
+    }
+
+    let mut token = String::new();
+    let mut inst_id = String::new();
+    for line in stdout.lines() {
+        if line.starts_with("TOKEN=") {
+            token = line["TOKEN=".len()..].trim().to_string();
+        } else if line.starts_with("Found Installation ID: ") {
+            inst_id = line["Found Installation ID: ".len()..]
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .to_string();
+        }
+    }
+
+    if token.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "success": false,
+                "error": format!("Failed to extract token: {stdout}")
+            })),
+        )
+            .into_response();
+    }
+
+    // 若传入了 project_hash，自动将签发好的 token 及 App 凭据同步写入持久化文件
+    if let Some(hash) = req.project_hash.filter(|s| !s.trim().is_empty()) {
+        if let Some(mut cfg) = crate::git_adapter::get_binding_by_project(&hash) {
+            cfg.access_token = token.clone();
+            cfg.github_app_id = Some(req.app_id.to_string());
+            if !is_temp {
+                cfg.github_app_private_key_path = Some(key_path.to_string_lossy().to_string());
+            }
+            crate::git_adapter::save_binding(cfg);
+        }
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "success": true,
+            "token": token,
+            "installationId": inst_id,
+            "message": format!("Successfully generated official GitHub App [bot] token! (Installation: {inst_id})")
+        })),
+    ).into_response()
+}
+
 /// GET /api/webhooks/git & GET /api/webhooks/github
 /// 当用户或浏览器直接以 GET 方式访问该链接时，返回友好的就绪状态提示（替代冰冷的 HTTP 405 Method Not Allowed）
 pub async fn get_git_webhook_info_api() -> impl IntoResponse {

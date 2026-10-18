@@ -262,6 +262,24 @@ pub struct GitAdapterConfig {
         alias = "review_model"
     )]
     pub review_model: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "github_app_id"
+    )]
+    pub github_app_id: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "github_app_private_key"
+    )]
+    pub github_app_private_key: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "github_app_private_key_path"
+    )]
+    pub github_app_private_key_path: Option<String>,
 }
 
 fn default_keyword() -> String {

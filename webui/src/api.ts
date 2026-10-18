@@ -2900,6 +2900,37 @@ export async function saveGitBinding(config: any): Promise<{ success: boolean; e
   return resp.json();
 }
 
+export async function generateGitHubAppToken(payload: {
+  appId: number;
+  privateKeyPath?: string;
+  privateKey?: string;
+  repoIdentifier?: string;
+  projectHash?: string;
+}): Promise<{
+  success: boolean;
+  token?: string;
+  installationId?: string;
+  message?: string;
+  error?: string;
+}> {
+  const resp = await apiFetch('/api/git/generate-token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify(payload),
+  });
+  if (!resp.ok) {
+    let errorMsg = '';
+    try {
+      const err = await resp.json();
+      errorMsg = err.error || err.message;
+    } catch {
+      errorMsg = await resp.text().catch(() => '');
+    }
+    return { success: false, error: errorMsg || `HTTP ${resp.status}` };
+  }
+  return resp.json();
+}
+
 export async function testGitBinding(
   config: any
 ): Promise<{ success: boolean; message?: string; error?: string }> {

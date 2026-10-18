@@ -1,5 +1,5 @@
-import { useState, useEffect } from 'preact/hooks';
-import { ProjectInfo, saveGitBinding, getGitBinding, getRemoteAccess, testGitBinding } from '../api';
+import { useState, useEffect, useRef } from 'preact/hooks';
+import { ProjectInfo, saveGitBinding, getGitBinding, getRemoteAccess, testGitBinding, generateGitHubAppToken } from '../api';
 import { useT, useSettings } from '../settings';
 import { Select, SelectOption } from './Select';
 import { ModelSelector } from './ModelSelector';
@@ -123,6 +123,9 @@ export interface GitAdapterConfig {
   syncMode: GitSyncMode;
   repoIdentifier: string;
   accessToken: string;
+  githubAppId?: string;
+  githubAppPrivateKey?: string;
+  githubAppPrivateKeyPath?: string;
   customApiBase: string;
   webhook: WebhookConfig;
   polling: PollingConfig;
@@ -200,6 +203,13 @@ export function normalizeWebhookHost(host: string): string {
 
 export function stripWebhookSuffix(url: string): string {
   return normalizeWebhookHost(url);
+}
+
+export function stripHostPortAndSuffix(url: string): string {
+  let clean = normalizeWebhookHost(url);
+  // 剥离末尾可能误输入的端口号（如 :13460 或 :13461），因为右侧蓝字徽章已固定绑定当前端口
+  clean = clean.replace(/:\d+\/?$/i, '').replace(/\/+$/, '');
+  return clean;
 }
 
 /**
@@ -287,6 +297,9 @@ export function getProjectGitConfig(projectHash: string, lang?: string): GitAdap
     syncMode: 'webhook',
     repoIdentifier: '',
     accessToken: '',
+    githubAppId: '',
+    githubAppPrivateKey: '',
+    githubAppPrivateKeyPath: '',
     customApiBase: '',
     webhook: {
       payloadUrl: defaultUrl,
@@ -332,6 +345,9 @@ export function getProjectGitConfig(projectHash: string, lang?: string): GitAdap
         lastEnabledState: lastEnabled,
         repoIdentifier: repoId,
         accessToken: pat,
+        githubAppId: parsed.githubAppId || parsed.github_app_id || '',
+        githubAppPrivateKey: parsed.githubAppPrivateKey || parsed.github_app_private_key || '',
+        githubAppPrivateKeyPath: parsed.githubAppPrivateKeyPath || parsed.github_app_private_key_path || '',
         reviewModel: parsed.reviewModel || parsed.review_model || '',
         webhook: {
           payloadUrl,
@@ -370,6 +386,9 @@ export function toCleanApiPayload(config: GitAdapterConfig, projectHash: string)
     syncMode: config.syncMode || 'webhook',
     repoIdentifier: (config.repoIdentifier || '').trim(),
     accessToken: (config.accessToken || '').trim(),
+    githubAppId: config.githubAppId?.trim() || undefined,
+    githubAppPrivateKey: config.githubAppPrivateKey || undefined,
+    githubAppPrivateKeyPath: config.githubAppPrivateKeyPath?.trim() || undefined,
     customApiBase: (config.customApiBase || '').trim(),
     webhook: {
       payloadUrl: cleanPayload,
@@ -424,6 +443,10 @@ export function GitWebhookDialog({ project, onClose, onSaved }: GitWebhookDialog
   const [showToken, setShowToken] = useState(false);
   const [copyStatus, setCopyStatus] = useState<Record<string, string>>({});
   const [toast, setToast] = useState<{ msg: string; type: 'success' | 'error' } | null>(null);
+
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [calcLoading, setCalcLoading] = useState(false);
+  const [showManualPat, setShowManualPat] = useState(false);
 
   // 动态响应页面/浏览器缩放与视口尺寸变动，自适应计算弹窗最大高度与居中边界，彻底防止大比例缩放下被遮挡
   const [modalAdaptiveStyle, setModalAdaptiveStyle] = useState<{ maxHeight?: string; width?: string }>({});
@@ -503,6 +526,9 @@ export function GitWebhookDialog({ project, onClose, onSaved }: GitWebhookDialog
           const effectiveRepo = (remote.repoIdentifier && remote.repoIdentifier.trim()) ||
                                 (remote.repo_identifier && remote.repo_identifier.trim()) ||
                                 prev.repoIdentifier;
+          const effectiveAppId = remote.githubAppId || remote.github_app_id || prev.githubAppId;
+          const effectiveKeyPath = remote.githubAppPrivateKeyPath || remote.github_app_private_key_path || prev.githubAppPrivateKeyPath;
+          const effectiveKey = remote.githubAppPrivateKey || remote.github_app_private_key || prev.githubAppPrivateKey;
           const effectivePrompt = (remote.reviewPromptTemplate && remote.reviewPromptTemplate.trim()) ||
                                   (remote.review_prompt_template && remote.review_prompt_template.trim()) ||
                                   prev.reviewPromptTemplate;
@@ -512,6 +538,9 @@ export function GitWebhookDialog({ project, onClose, onSaved }: GitWebhookDialog
             ...remote,
             accessToken: effectiveToken,
             repoIdentifier: effectiveRepo,
+            githubAppId: effectiveAppId,
+            githubAppPrivateKeyPath: effectiveKeyPath,
+            githubAppPrivateKey: effectiveKey,
             reviewPromptTemplate: effectivePrompt,
             webhook: {
               ...prev.webhook,
@@ -578,6 +607,58 @@ export function GitWebhookDialog({ project, onClose, onSaved }: GitWebhookDialog
       ...prev,
       webhook: { ...prev.webhook, secret: newSecret },
     }));
+  };
+
+  const handleCalcAppToken = async () => {
+    const appId = Number(config.githubAppId);
+    if (!appId || isNaN(appId)) {
+      showToast('请输入有效的纯数字 GitHub App ID', 'error');
+      return;
+    }
+    if (!config.githubAppPrivateKeyPath && !config.githubAppPrivateKey) {
+      showToast('请先选择或输入 .pem 私钥文件路径', 'error');
+      return;
+    }
+    setCalcLoading(true);
+    try {
+      const res = await generateGitHubAppToken({
+        appId,
+        privateKeyPath: config.githubAppPrivateKeyPath,
+        privateKey: config.githubAppPrivateKey,
+        repoIdentifier: config.repoIdentifier || 'jeikl/JeikCode',
+        projectHash: project.hash,
+      });
+      if (res.success && res.token) {
+        setConfig((prev) => ({
+          ...prev,
+          accessToken: res.token!,
+        }));
+        showToast(res.message || '官方 [bot] 令牌计算并签发成功！', 'success');
+      } else {
+        showToast(res.error || '计算签发令牌失败', 'error');
+      }
+    } catch (e: any) {
+      showToast(e.message || '计算令牌失败', 'error');
+    } finally {
+      setCalcLoading(false);
+    }
+  };
+
+  const handleFileChosen = async (e: Event) => {
+    const input = e.target as HTMLInputElement;
+    const file = input.files?.[0];
+    if (!file) return;
+    try {
+      const content = await file.text();
+      setConfig((prev) => ({
+        ...prev,
+        githubAppPrivateKeyPath: (file as any).path || file.name,
+        githubAppPrivateKey: content,
+      }));
+      showToast(`已加载私钥文件: ${file.name}`, 'success');
+    } catch (err: any) {
+      showToast(`读取私钥文件失败: ${err.message}`, 'error');
+    }
   };
 
   const handleResetPrompt = () => {
@@ -749,8 +830,39 @@ export function GitWebhookDialog({ project, onClose, onSaved }: GitWebhookDialog
 
           {/* 适配器核心配置区：双下拉框（渠道选择 + 模式选择） */}
           <div class="git-form-section">
-            <div class="git-section-title">
+            <div class="git-section-title" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '8px' }}>
               <span>1. {t('gitWebhook.secStrategyTitle')}</span>
+              {config.channel === 'github' && (
+                <div class="git-header-capsules">
+                  <a
+                    href="https://github.com/settings/apps/new"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    class="git-capsule-btn"
+                    title="在 GitHub 新建官方审查机器人 App"
+                  >
+                    🚀 {t('gitWebhook.capsuleApplyApp')}
+                  </a>
+                  <a
+                    href="https://github.com/settings/apps"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    class="git-capsule-btn"
+                    title="查看你的 GitHub App ID"
+                  >
+                    🆔 {t('gitWebhook.capsuleAppId')}
+                  </a>
+                  <a
+                    href="https://github.com/settings/apps"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    class="git-capsule-btn"
+                    title="在 GitHub App -> Credentials -> Key pairs 获取 .pem 私钥"
+                  >
+                    🔑 {t('gitWebhook.capsuleAppKey')}
+                  </a>
+                </div>
+              )}
             </div>
             
             <div class="git-form-grid">
@@ -817,32 +929,32 @@ export function GitWebhookDialog({ project, onClose, onSaved }: GitWebhookDialog
                     <input
                       type="text"
                       class="git-group-input"
-                      value={config.webhook.payloadUrl || ''}
-                      placeholder={`http(s)://yourdomain:${livePort}`}
+                      value={stripHostPortAndSuffix(config.webhook.payloadUrl || '')}
+                      placeholder={`http(s)://yourdomain`}
                       onInput={(e) => {
                         const val = (e.target as HTMLInputElement).value;
                         const normalized = normalizeWebhookHost(val);
+                        const cleanHost = stripHostPortAndSuffix(normalized);
                         setConfig({
                           ...config,
                           webhook: {
                             ...config.webhook,
-                            payloadUrl: normalized,
+                            payloadUrl: cleanHost,
                           },
                         });
                         // 用户编辑后，实时同步为全局默认继承项
-                        const cleanHost = normalized.replace(/\/+$/, '').trim();
                         if (cleanHost) {
                           setLastWebhookHost(cleanHost);
                         }
                       }}
                     />
-                    <span class="git-group-addon">/api/webhooks/git</span>
+                    <span class="git-group-addon">:{livePort}/api/webhooks/git</span>
                     <button
                       type="button"
                       class="git-group-btn"
                       onClick={() => {
-                        const host = config.webhook.payloadUrl.trim() || `http(s)://yourdomain:${livePort}`;
-                        copyToClipboard(`${stripWebhookSuffix(host)}/api/webhooks/git`, 'url');
+                        const host = stripHostPortAndSuffix(config.webhook.payloadUrl.trim() || `http://127.0.0.1`);
+                        copyToClipboard(`${host}:${livePort}/api/webhooks/git`, 'url');
                       }}
                       title={t('gitWebhook.copyFullUrlHint')}
                     >
@@ -935,54 +1047,175 @@ export function GitWebhookDialog({ project, onClose, onSaved }: GitWebhookDialog
 
           {/* 适配器第 3 区：动态绑定的仓库标识与平台认证凭据 */}
           <div class="git-form-section">
-            <div class="git-section-title">
+            <div class="git-section-title" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '8px' }}>
               <span>3. {t('gitWebhook.secAuthTitle')}</span>
+              {config.channel === 'github' && (
+                <button
+                  type="button"
+                  class="git-text-action-btn"
+                  onClick={() => setShowManualPat(!showManualPat)}
+                  style={{ fontSize: '11px' }}
+                >
+                  {showManualPat ? t('gitWebhook.useGithubApp') : t('gitWebhook.useManualPat')}
+                </button>
+              )}
             </div>
-            <div class="git-form-grid">
-              {/* 动态 Label、Placeholder 与 Hint */}
-              <div class="git-form-item">
-                <label class="git-form-label">
-                  {t(activeChannelMeta.repoLabelKey as any)} <span style={{ color: '#ef4444' }}>*</span>
-                </label>
-                <input
-                  type="text"
-                  class="git-input"
-                  placeholder={t(activeChannelMeta.repoSampleKey as any)}
-                  value={config.repoIdentifier}
-                  onInput={(e) => {
-                    const raw = (e.target as HTMLInputElement).value;
-                    const cleanRepo = raw.replace(/[／、]/g, '/');
-                    setConfig({ ...config, repoIdentifier: cleanRepo });
-                  }}
-                />
-                <span class="git-input-hint">{t(activeChannelMeta.repoHintKey as any)}</span>
-              </div>
 
-              {/* 动态 Token Name、Placeholder 与 Hint */}
-              <div class="git-form-item">
-                <label class="git-form-label">
-                  {t(activeChannelMeta.tokenNameKey as any)} <span style={{ color: '#ef4444' }}>*</span>
-                </label>
-                <div class="git-input-with-actions">
-                  <input
-                    type={showToken ? 'text' : 'password'}
-                    class="git-input"
-                    placeholder={activeChannelMeta.tokenPlaceholder}
-                    value={config.accessToken}
-                    onInput={(e) => setConfig({ ...config, accessToken: (e.target as HTMLInputElement).value.trim() })}
-                  />
-                  <button
-                    type="button"
-                    class="git-aux-btn"
-                    onClick={() => setShowToken(!showToken)}
-                    title={showToken ? t('gitWebhook.hideToken') : t('gitWebhook.showToken')}
-                  >
-                    {showToken ? '🙈' : '👁️'}
-                  </button>
+            {config.channel === 'github' && !showManualPat ? (
+              <div class="git-form-grid" style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+                <div class="git-form-grid">
+                  {/* GitHub 仓库全名 */}
+                  <div class="git-form-item">
+                    <label class="git-form-label">
+                      {t(activeChannelMeta.repoLabelKey as any)} <span style={{ color: '#ef4444' }}>*</span>
+                    </label>
+                    <input
+                      type="text"
+                      class="git-input"
+                      placeholder={t(activeChannelMeta.repoSampleKey as any)}
+                      value={config.repoIdentifier}
+                      onInput={(e) => {
+                        const raw = (e.target as HTMLInputElement).value;
+                        const cleanRepo = raw.replace(/[／、]/g, '/');
+                        setConfig({ ...config, repoIdentifier: cleanRepo });
+                      }}
+                    />
+                    <span class="git-input-hint">{t(activeChannelMeta.repoHintKey as any)}</span>
+                  </div>
+
+                  {/* GitHub App ID */}
+                  <div class="git-form-item">
+                    <label class="git-form-label">
+                      {t('gitWebhook.appIdLabel')} <span style={{ color: '#ef4444' }}>*</span>
+                    </label>
+                    <input
+                      type="text"
+                      class="git-input"
+                      placeholder={t('gitWebhook.appIdPlaceholder')}
+                      value={config.githubAppId || ''}
+                      onInput={(e) => {
+                        const val = (e.target as HTMLInputElement).value.trim();
+                        setConfig({ ...config, githubAppId: val });
+                      }}
+                    />
+                    <span class="git-input-hint">{t('gitWebhook.appIdHint')}</span>
+                  </div>
                 </div>
-                <span class="git-input-hint">{t(activeChannelMeta.tokenHintKey as any)}</span>
+
+                {/* GitHub App 私钥文件 (.pem) */}
+                <div class="git-form-item">
+                  <label class="git-form-label">
+                    {t('gitWebhook.privateKeyLabel')} <span style={{ color: '#ef4444' }}>*</span>
+                  </label>
+                  <input
+                    type="file"
+                    ref={fileInputRef}
+                    accept=".pem,.key,.txt"
+                    style={{ display: 'none' }}
+                    onChange={handleFileChosen}
+                  />
+                  <div class="git-input-with-actions">
+                    <input
+                      type="text"
+                      class="git-input"
+                      placeholder={t('gitWebhook.privateKeyPlaceholder')}
+                      value={config.githubAppPrivateKeyPath || ''}
+                      onInput={(e) => {
+                        const pathVal = (e.target as HTMLInputElement).value.trim();
+                        setConfig({ ...config, githubAppPrivateKeyPath: pathVal });
+                      }}
+                    />
+                    <button
+                      type="button"
+                      class="git-aux-btn"
+                      onClick={() => fileInputRef.current?.click()}
+                      title="在文件管理器中选择 .pem 私钥文件"
+                    >
+                      {t('gitWebhook.browsePrivateKey')}
+                    </button>
+                    <button
+                      type="button"
+                      class="git-aux-btn git-token-calc-btn"
+                      onClick={handleCalcAppToken}
+                      disabled={calcLoading}
+                      title="由 JeikCode 后端自动生成 JWT 并签发官方 [bot] 访问令牌"
+                    >
+                      {calcLoading ? '...' : t('gitWebhook.calcAppToken')}
+                    </button>
+                  </div>
+                  <span class="git-input-hint">
+                    {config.githubAppPrivateKey ? '✓ 私钥已就绪（保存在本地持久化配置中，后端内部自动签名）' : '选择或输入从 GitHub 下载的 .pem 私钥文件路径'}
+                  </span>
+                </div>
+
+                {/* 官方 Bot 令牌激活状态横幅 */}
+                {config.accessToken && (
+                  <div class="git-app-status-box">
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                      <span style={{ fontSize: '14px' }}>🛡️</span>
+                      <strong>{t('gitWebhook.appTokenActive')}</strong>
+                      <span style={{ fontFamily: 'monospace', fontSize: '11px', opacity: 0.85 }}>
+                        ({showToken ? config.accessToken.slice(0, 24) + '...' : '••••••••••••••••••••••••'})
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      class="git-aux-btn"
+                      style={{ padding: '2px 8px', height: '24px', fontSize: '11px' }}
+                      onClick={() => setShowToken(!showToken)}
+                    >
+                      {showToken ? t('gitWebhook.hideToken') : t('gitWebhook.showToken')}
+                    </button>
+                  </div>
+                )}
               </div>
-            </div>
+            ) : (
+              <div class="git-form-grid">
+                {/* 动态 Label、Placeholder 与 Hint */}
+                <div class="git-form-item">
+                  <label class="git-form-label">
+                    {t(activeChannelMeta.repoLabelKey as any)} <span style={{ color: '#ef4444' }}>*</span>
+                  </label>
+                  <input
+                    type="text"
+                    class="git-input"
+                    placeholder={t(activeChannelMeta.repoSampleKey as any)}
+                    value={config.repoIdentifier}
+                    onInput={(e) => {
+                      const raw = (e.target as HTMLInputElement).value;
+                      const cleanRepo = raw.replace(/[／、]/g, '/');
+                      setConfig({ ...config, repoIdentifier: cleanRepo });
+                    }}
+                  />
+                  <span class="git-input-hint">{t(activeChannelMeta.repoHintKey as any)}</span>
+                </div>
+
+                {/* 动态 Token Name、Placeholder 与 Hint */}
+                <div class="git-form-item">
+                  <label class="git-form-label">
+                    {t(activeChannelMeta.tokenNameKey as any)} <span style={{ color: '#ef4444' }}>*</span>
+                  </label>
+                  <div class="git-input-with-actions">
+                    <input
+                      type={showToken ? 'text' : 'password'}
+                      class="git-input"
+                      placeholder={activeChannelMeta.tokenPlaceholder}
+                      value={config.accessToken}
+                      onInput={(e) => setConfig({ ...config, accessToken: (e.target as HTMLInputElement).value.trim() })}
+                    />
+                    <button
+                      type="button"
+                      class="git-aux-btn"
+                      onClick={() => setShowToken(!showToken)}
+                      title={showToken ? t('gitWebhook.hideToken') : t('gitWebhook.showToken')}
+                    >
+                      {showToken ? '🙈' : '👁️'}
+                    </button>
+                  </div>
+                  <span class="git-input-hint">{t(activeChannelMeta.tokenHintKey as any)}</span>
+                </div>
+              </div>
+            )}
           </div>
 
           {/* 适配器第 4 区：订阅事件与唤醒规则 */}
