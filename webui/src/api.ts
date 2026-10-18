@@ -2900,8 +2900,14 @@ export async function testGitBinding(
     body: JSON.stringify(config),
   });
   if (!resp.ok) {
-    const err = await resp.json().catch(() => ({}));
-    return { success: false, error: err.error || `HTTP ${resp.status}` };
+    let errorMsg = '';
+    try {
+      const err = await resp.json();
+      errorMsg = err.error || err.message;
+    } catch {
+      errorMsg = await resp.text().catch(() => '');
+    }
+    return { success: false, error: errorMsg || `HTTP ${resp.status}` };
   }
   return resp.json();
 }

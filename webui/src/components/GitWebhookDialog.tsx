@@ -354,38 +354,53 @@ export function getProjectGitConfig(projectHash: string, lang?: string): GitAdap
   return defaultConfig;
 }
 
+/**
+ * 构造一份干净的标准驼峰 API 载荷（彻底剔除任何残留的下划线字段，防止 Serde 因 duplicate field 抛出 HTTP 422 错误）
+ */
+export function toCleanApiPayload(config: GitAdapterConfig, projectHash: string): any {
+  const cleanPayload = config.webhook?.payloadUrl
+    ? normalizeWebhookHost(config.webhook.payloadUrl).replace(/\/+$/, '')
+    : '';
+
+  return {
+    projectHash,
+    enabled: Boolean(config.enabled),
+    lastEnabledState: Boolean(config.lastEnabledState),
+    channel: config.channel || 'github',
+    syncMode: config.syncMode || 'webhook',
+    repoIdentifier: (config.repoIdentifier || '').trim(),
+    accessToken: (config.accessToken || '').trim(),
+    customApiBase: (config.customApiBase || '').trim(),
+    webhook: {
+      payloadUrl: cleanPayload,
+      secret: config.webhook?.secret || '',
+    },
+    polling: {
+      intervalSeconds: Number(config.polling?.intervalSeconds) || 60,
+      onlyActivePr: config.polling?.onlyActivePr !== false,
+    },
+    events: {
+      pullRequest: config.events?.pullRequest !== false,
+      issueComment: config.events?.issueComment !== false,
+      push: Boolean(config.events?.push),
+    },
+    triggerKeyword: config.triggerKeyword || '@bot',
+    autoReviewNewPr: config.autoReviewNewPr !== false,
+    updateExistingComment: config.updateExistingComment !== false,
+    reviewPromptTemplate: config.reviewPromptTemplate || '',
+    reviewModel: config.reviewModel || undefined,
+    lang: config.lang || undefined,
+  };
+}
+
 export function saveProjectGitConfig(projectHash: string, config: GitAdapterConfig): void {
   const cleanPayload = config.webhook?.payloadUrl
     ? normalizeWebhookHost(config.webhook.payloadUrl).replace(/\/+$/, '')
     : '';
-  const normalizedConfig: any = {
-    ...config,
-    projectHash,
-    webhook: {
-      ...config.webhook,
-      payloadUrl: cleanPayload,
-    },
-  };
-  // 必须清理下划线重复字段，防止 Serde 因 duplicate field 抛错而静默保存失败
-  delete normalizedConfig.project_hash;
-  delete normalizedConfig.repo_identifier;
-  delete normalizedConfig.access_token;
-  delete normalizedConfig.custom_api_base;
-  delete normalizedConfig.sync_mode;
-  if (normalizedConfig.webhook) {
-    delete normalizedConfig.webhook.payload_url;
-  }
-  if (normalizedConfig.polling) {
-    delete normalizedConfig.polling.interval_seconds;
-    delete normalizedConfig.polling.only_active_pr;
-  }
-  if (normalizedConfig.events) {
-    delete normalizedConfig.events.pull_request;
-    delete normalizedConfig.events.issue_comment;
-  }
+  const clean = toCleanApiPayload(config, projectHash);
 
   try {
-    localStorage.setItem(`jeikcode_git_binding_${projectHash}`, JSON.stringify(normalizedConfig));
+    localStorage.setItem(`jeikcode_git_binding_${projectHash}`, JSON.stringify(clean));
     if (cleanPayload) {
       setLastWebhookHost(cleanPayload);
     }
@@ -393,7 +408,7 @@ export function saveProjectGitConfig(projectHash: string, config: GitAdapterConf
     // ignore
   }
   // 异步同步到后端持久化文件 (~/.jeikcode/git-bindings.json)
-  saveGitBinding(normalizedConfig).catch((e) => {
+  saveGitBinding(clean).catch((e) => {
     console.error('[git_webhook] Failed to save binding:', e);
   });
 }
@@ -563,19 +578,7 @@ export function GitWebhookDialog({ project, onClose, onSaved }: GitWebhookDialog
     }
     setTesting(true);
     try {
-      const payload: any = {
-        ...config,
-        projectHash: project.hash,
-        repoIdentifier: config.repoIdentifier.trim(),
-        accessToken: config.accessToken.trim(),
-        customApiBase: config.customApiBase.trim(),
-        syncMode: config.syncMode,
-      };
-      delete payload.project_hash;
-      delete payload.repo_identifier;
-      delete payload.access_token;
-      delete payload.custom_api_base;
-      delete payload.sync_mode;
+      const payload = toCleanApiPayload(config, project.hash);
       const res = await testGitBinding(payload);
       if (res.success) {
         showToast(
